@@ -73,7 +73,7 @@ Dim_Payment = pygrametl.tables.Dimension(
 
     attributes=[
         'Payment_Mode'
-    ]
+    ] , lookupatts=['Payment_ID']
 )    
 
 

@@ -77,7 +77,7 @@ from pygrametl.tables import Dimension
 Dim_Time = pygrametl.tables.Dimension(
     name='Dim_Time',
     key='FullDate',
-    attributes=['Year', 'Month', 'Day', 'MonthName', 'DayOfWeek', 'Trimester', 'IsWeekend', 'IsHoliday']
+    attributes=['Year', 'Month', 'Day', 'MonthName', 'DayOfWeek', 'Trimester', 'IsWeekend', 'IsHoliday'], lookupatts=['FullDate']
 )  
 
 

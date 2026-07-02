@@ -70,7 +70,7 @@ from pygrametl.tables import Dimension
 Dim_Promotion = pygrametl.tables.Dimension(
     name='Dim_Promotion',
     key='PromotionID',
-    attributes=['CodePromotion']
+    attributes=['CodePromotion'] , lookupatts=['PromotionID']
 )    
 
 

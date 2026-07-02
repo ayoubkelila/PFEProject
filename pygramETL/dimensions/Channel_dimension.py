@@ -54,7 +54,7 @@ create_table_sql = """
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Channel]') AND type in (N'U'))
 BEGIN
     CREATE TABLE Dim_Channel (
-        channel_ID VARCHAR(50) PRIMARY KEY,
+        channel_ID INT PRIMARY KEY,
         channel_name VARCHAR(100),
     );
 END
@@ -74,7 +74,8 @@ Dim_Channel = pygrametl.tables.Dimension(
 
     attributes=[
         'channel_name'
-    ]
+    ], 
+    lookupatts=['channel_ID']
 )    
 
 

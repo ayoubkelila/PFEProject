@@ -54,7 +54,7 @@ create_table_sql = """
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Channel]') AND type in (N'U'))
 BEGIN
     CREATE TABLE Dim_Channel (
-        channel_ID VARCHAR(50) PRIMARY KEY,
+        channel_ID INT PRIMARY KEY,
         channel_name VARCHAR(100),
     );
 END
@@ -67,27 +67,28 @@ dwh_connection.commit()
 
 
 from pygrametl.tables import Dimension
-Dim_Channel = pygrametl.tables.Dimension(
-    name='Dim_Channel',
+Dim_Campagne = pygrametl.tables.Dimension(
+    name='Dim_Campagne',
 
-    key='channel_ID',
+    key='Campaign_ID',
 
     attributes=[
-        'channel_name'
-    ]
+        'Campaign_Name'
+    ],
+    lookupatts=['Campaign_ID']
 )    
 
 
 # In[7]:
 
 
-channel_source=source_cursor.execute("SELECT Distinct CanalVente FROM source")
-for row in channel_source:
-    channel_data = {
-        "channel_name" : row.CanalVente
+campaign_source=source_cursor.execute("SELECT Distinct Campagne FROM source")
+for row in campaign_source:
+    campaign_data = {
+        "Campaign_Name" : row.NomCampagne
     }
-    print(channel_data)
-    Dim_Channel.ensure(channel_data)
+    print(campaign_data)
+    Dim_Campagne.ensure(campaign_data)
 dwh_connection.commit()
 dwh_cursor.close()
 dwh_connection.close()

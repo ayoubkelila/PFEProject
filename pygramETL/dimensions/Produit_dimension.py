@@ -77,7 +77,7 @@ Dim_Product = pygrametl.tables.Dimension(
         'Product_Name',
         'Category',
         'Subcategory'
-    ]
+    ] , lookupatts=['Product_ID']
 )    
 
 
