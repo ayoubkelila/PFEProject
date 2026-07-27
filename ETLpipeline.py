@@ -1,7 +1,14 @@
 import pyodbc
 import pygrametl
+import pickle
+import pandas as pd
 from datetime import datetime
+from pathlib import Path
 from pygrametl.tables import Dimension, FactTable
+
+# Folder holding the pretrained clustering artifacts (kmeans_model.pkl, scaler.pkl).
+# Put this next to ETLpipeline.py, e.g. ./models/kmeans_model.pkl and ./models/scaler.pkl
+MODELS_DIR = Path(__file__).parent / "models"
 
 # ---------------------------------------------------------------------------
 # 1. Connections (done once, instead of once per file)
@@ -178,6 +185,48 @@ create_statements = [
         ALTER TABLE Fact_Sale ADD CONSTRAINT FK_Fact_Sale_Campagne
             FOREIGN KEY (CampagneID) REFERENCES Dim_Campagne(Campaign_ID);
     """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND type = N'U')
+    BEGIN
+        CREATE TABLE Dim_Client_Segment (
+            Client_ID VARCHAR(50) PRIMARY KEY,
+            Recency INT,
+            Frequency INT,
+            Monetary DECIMAL(12, 2),
+            R_Score INT,
+            F_Score INT,
+            M_Score INT,
+            RFM_Score DECIMAL(4, 2),
+            Cluster_ID INT,
+            Segment_Label NVARCHAR(50),
+            SegmentDetail NVARCHAR(50),
+            Last_Updated DATE,
+            FOREIGN KEY (Client_ID) REFERENCES Dim_Client(Client_ID)
+        );
+    END
+    """,
+    # Guarded ALTERs so this also patches a Dim_Client_Segment table created by an
+    # earlier version of this script, without needing to drop and recreate it.
+    """
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'R_Score')
+        ALTER TABLE Dim_Client_Segment ADD R_Score INT;
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'F_Score')
+        ALTER TABLE Dim_Client_Segment ADD F_Score INT;
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'M_Score')
+        ALTER TABLE Dim_Client_Segment ADD M_Score INT;
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'RFM_Score')
+        ALTER TABLE Dim_Client_Segment ADD RFM_Score DECIMAL(4, 2);
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'SegmentDetail')
+        ALTER TABLE Dim_Client_Segment ADD SegmentDetail NVARCHAR(50);
+    """,
 ]
 
 for stmt in create_statements:
@@ -208,6 +257,15 @@ Dim_Client = pygrametl.tables.Dimension(
     key='Client_ID',
     attributes=['Full_Name', 'Gender', 'Age', 'Age_Group', 'Ville', 'Region',
                 'Registration_Date', 'Client_Type'],
+    lookupatts=['Client_ID']
+)
+
+Dim_Client_Segment = pygrametl.tables.Dimension(
+    name='Dim_Client_Segment',
+    key='Client_ID',
+    attributes=['Recency', 'Frequency', 'Monetary', 'R_Score', 'F_Score',
+                'M_Score', 'RFM_Score', 'Cluster_ID', 'Segment_Label',
+                'SegmentDetail', 'Last_Updated'],
     lookupatts=['Client_ID']
 )
 
@@ -440,6 +498,128 @@ for row in sale_source:
     counter += 1
     fact_sale.insert(fact_row)
 print(f"Inserted {counter} rows into Fact_Sale.")
+dwh_connection.commit()
+
+# ---------------------------------------------------------------------------
+# 11.5 Compute RFM and assign client segments with the pretrained K-means model
+#      Full overwrite every run: no history, just today's snapshot.
+# ---------------------------------------------------------------------------
+with open(MODELS_DIR / "scaler.pkl", "rb") as f:
+    rfm_scaler = pickle.load(f)
+with open(MODELS_DIR / "kmeans_model.pkl", "rb") as f:
+    rfm_kmeans = pickle.load(f)
+
+# Cluster -> business label, derived once from inspecting kmeans.cluster_centers_
+# (scaled order is [recency, frequency, monetary]):
+#   cluster 0: recency slightly below avg, frequency/monetary slightly below avg -> Reguliers
+#   cluster 1: recency low (recent), frequency & monetary high                   -> Champions
+#   cluster 2: recency high (long time since last purchase), frequency/monetary low -> A_Risque
+CLUSTER_LABELS = {
+    0: "Clients Réguliers",
+    1: "Champions",
+    2: "Clients à Risque / Perdus",
+}
+
+# Reference point for Recency: this is a static historical dataset, not a live feed,
+# so "today" = the latest sale date actually present in Fact_Sale, not datetime.now().
+reference_date = dwh_cursor.execute("SELECT MAX(FullDate) FROM Fact_Sale").fetchone()[0]
+
+rfm_rows = dwh_cursor.execute(
+    """
+    SELECT Client_ID,
+           DATEDIFF(day, MAX(FullDate), ?) AS Recency,
+           COUNT(TransactionID)            AS Frequency,
+           SUM(MontantFinal)               AS Monetary
+    FROM Fact_Sale
+    GROUP BY Client_ID
+    """,
+    reference_date
+).fetchall()
+
+rfm_df = pd.DataFrame.from_records(
+    rfm_rows, columns=["Client_ID", "Recency", "Frequency", "Monetary"]
+)
+
+# Same column order the scaler/model were fit on: recency, frequency, monetary.
+# Pass a plain numpy array (not a DataFrame) so sklearn doesn't check column
+# names -- the scaler/model were fit on lowercase names ('recency', etc.)
+# from the original notebook, while this DataFrame uses capitalized names.
+X_scaled = rfm_scaler.transform(
+    rfm_df[["Recency", "Frequency", "Monetary"]].to_numpy()
+)
+rfm_df["Cluster_ID"] = rfm_kmeans.predict(X_scaled)
+rfm_df["Segment_Label"] = rfm_df["Cluster_ID"].map(CLUSTER_LABELS)
+
+# ---- R/F/M quintile scores (1-5, recomputed fresh against this run's population) ----
+# rank(method='first') breaks ties so qcut always gets 5 clean, equal-sized bins,
+# same trick your original notebook used to avoid duplicate-bin-edge errors.
+rfm_df["R_Score"] = pd.qcut(
+    rfm_df["Recency"].rank(method="first", ascending=True), 5, labels=[5, 4, 3, 2, 1]
+).astype(int)
+rfm_df["F_Score"] = pd.qcut(
+    rfm_df["Frequency"].rank(method="first", ascending=False), 5, labels=[5, 4, 3, 2, 1]
+).astype(int)
+rfm_df["M_Score"] = pd.qcut(
+    rfm_df["Monetary"].rank(method="first", ascending=False), 5, labels=[5, 4, 3, 2, 1]
+).astype(int)
+rfm_df["RFM_Score"] = ((rfm_df["R_Score"] + rfm_df["F_Score"] + rfm_df["M_Score"]) / 3).round(2)
+
+# ---- Split "Clients à Risque / Perdus" into Nouveaux / À Surveiller / Perdus ----
+# The model only has 3 clusters, so this split isn't something k-means gives us --
+# it's a business rule layered on top of that one cluster.
+AT_RISK_LABEL = "Clients à Risque / Perdus"
+NEW_CLIENT_WINDOW_DAYS = 90  # tune this to your business's definition of "new"
+
+client_reg_rows = dwh_cursor.execute(
+    "SELECT Client_ID, Registration_Date FROM Dim_Client"
+).fetchall()
+reg_df = pd.DataFrame.from_records(
+    client_reg_rows, columns=["Client_ID", "Registration_Date"]
+)
+rfm_df = rfm_df.merge(reg_df, on="Client_ID", how="left")
+rfm_df["Days_Since_Registration"] = rfm_df["Registration_Date"].apply(
+    lambda d: (reference_date - d).days if pd.notna(d) else None
+)
+
+# Default: everyone outside the at-risk cluster keeps their top-level label as detail
+rfm_df["SegmentDetail"] = rfm_df["Segment_Label"]
+
+at_risk_mask = rfm_df["Segment_Label"] == AT_RISK_LABEL
+new_mask = at_risk_mask & (rfm_df["Days_Since_Registration"] <= NEW_CLIENT_WINDOW_DAYS)
+rfm_df.loc[new_mask, "SegmentDetail"] = "Nouveaux Clients"
+
+# Whatever's left in the at-risk cluster (not "new") gets split by how stale they
+# are: the most-stale third are "Perdus", the rest are "À Surveiller".
+remaining_mask = at_risk_mask & ~new_mask
+if remaining_mask.any():
+    recency_p66 = rfm_df.loc[remaining_mask, "Recency"].quantile(0.66)
+    stale_mask = remaining_mask & (rfm_df["Recency"] > recency_p66)
+    watch_mask = remaining_mask & ~stale_mask
+    rfm_df.loc[stale_mask, "SegmentDetail"] = "Perdus"
+    rfm_df.loc[watch_mask, "SegmentDetail"] = "À Surveiller"
+
+# Full overwrite: truncate then reinsert every run via the pygrametl Dimension object
+dwh_cursor.execute("TRUNCATE TABLE Dim_Client_Segment")
+
+counter = 0
+for r in rfm_df.itertuples(index=False):
+    segment_data = {
+        "Client_ID": str(r.Client_ID),
+        "Recency": int(r.Recency),      # cast off numpy/pandas dtypes so pyodbc accepts them
+        "Frequency": int(r.Frequency),
+        "Monetary": float(r.Monetary),
+        "R_Score": int(r.R_Score),
+        "F_Score": int(r.F_Score),
+        "M_Score": int(r.M_Score),
+        "RFM_Score": float(r.RFM_Score),
+        "Cluster_ID": int(r.Cluster_ID),
+        "Segment_Label": r.Segment_Label,
+        "SegmentDetail": r.SegmentDetail,
+        "Last_Updated": reference_date
+    }
+    Dim_Client_Segment.insert(segment_data)
+    counter += 1
+print(f"Inserted {counter} rows into Dim_Client_Segment.")
 dwh_connection.commit()
 
 # ---------------------------------------------------------------------------
