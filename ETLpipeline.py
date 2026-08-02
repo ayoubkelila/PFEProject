@@ -23,7 +23,7 @@ STAGING_CONNECTION_STRING = (
 DWH_CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
     "Server=DESKTOP-AR905LJ;"
-    "Database=DWH2;"
+    "Database=DWH;"
     "UID=sa;"
     "PWD=ghom3220;"
 )
@@ -207,7 +207,7 @@ create_statements = [
             R_Score INT,
             F_Score INT,
             M_Score INT,
-            RFM_Score DECIMAL(4, 2),
+            RFM_Score INT,
             Cluster_ID INT,
             Segment_Label NVARCHAR(50),
             SegmentDetail NVARCHAR(50),
@@ -551,7 +551,7 @@ rfm_df["F_Score"] = pd.qcut(
 rfm_df["M_Score"] = pd.qcut(
     rfm_df["Monetary"].rank(method="first", ascending=False), 5, labels=[5, 4, 3, 2, 1]
 ).astype(int)
-rfm_df["RFM_Score"] = ((rfm_df["R_Score"] + rfm_df["F_Score"] + rfm_df["M_Score"]) / 3).round(2)
+rfm_df["RFM_Score"] = (rfm_df["R_Score"] * 100 + rfm_df["F_Score"] * 10 + rfm_df["M_Score"])
 
 # ---- Split "Clients à Risque / Perdus" into Nouveaux / À Surveiller / Perdus ----
 # The model only has 3 clusters, so this split isn't something k-means gives us --
@@ -600,7 +600,7 @@ for r in rfm_df.itertuples(index=False):
         "R_Score": int(r.R_Score),
         "F_Score": int(r.F_Score),
         "M_Score": int(r.M_Score),
-        "RFM_Score": float(r.RFM_Score),
+        "RFM_Score": int(r.RFM_Score),
         "Cluster_ID": int(r.Cluster_ID),
         "Segment_Label": r.Segment_Label,
         "SegmentDetail": r.SegmentDetail,
