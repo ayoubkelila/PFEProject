@@ -186,10 +186,21 @@ create_statements = [
             FOREIGN KEY (CampagneID) REFERENCES Dim_Campagne(Campaign_ID);
     """,
     """
+    -- Migrate a table created by an earlier version of this script (Client_ID as PK)
+    -- to the new surrogate-key schema. Safe because this table is fully
+    -- truncated and reloaded every run -- there's no history to lose.
+    IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND type = N'U')
+       AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'Segment_ID')
+    BEGIN
+        DROP TABLE Dim_Client_Segment;
+    END
+    """,
+    """
     IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND type = N'U')
     BEGIN
         CREATE TABLE Dim_Client_Segment (
-            Client_ID VARCHAR(50) PRIMARY KEY,
+            Segment_ID INT PRIMARY KEY,
+            Client_ID VARCHAR(50) NOT NULL UNIQUE,
             Recency INT,
             Frequency INT,
             Monetary DECIMAL(12, 2),
@@ -204,28 +215,6 @@ create_statements = [
             FOREIGN KEY (Client_ID) REFERENCES Dim_Client(Client_ID)
         );
     END
-    """,
-    # Guarded ALTERs so this also patches a Dim_Client_Segment table created by an
-    # earlier version of this script, without needing to drop and recreate it.
-    """
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'R_Score')
-        ALTER TABLE Dim_Client_Segment ADD R_Score INT;
-    """,
-    """
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'F_Score')
-        ALTER TABLE Dim_Client_Segment ADD F_Score INT;
-    """,
-    """
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'M_Score')
-        ALTER TABLE Dim_Client_Segment ADD M_Score INT;
-    """,
-    """
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'RFM_Score')
-        ALTER TABLE Dim_Client_Segment ADD RFM_Score DECIMAL(4, 2);
-    """,
-    """
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'SegmentDetail')
-        ALTER TABLE Dim_Client_Segment ADD SegmentDetail NVARCHAR(50);
     """,
 ]
 
@@ -262,8 +251,8 @@ Dim_Client = pygrametl.tables.Dimension(
 
 Dim_Client_Segment = pygrametl.tables.Dimension(
     name='Dim_Client_Segment',
-    key='Client_ID',
-    attributes=['Recency', 'Frequency', 'Monetary', 'R_Score', 'F_Score',
+    key='Segment_ID',
+    attributes=['Client_ID', 'Recency', 'Frequency', 'Monetary', 'R_Score', 'F_Score',
                 'M_Score', 'RFM_Score', 'Cluster_ID', 'Segment_Label',
                 'SegmentDetail', 'Last_Updated'],
     lookupatts=['Client_ID']
