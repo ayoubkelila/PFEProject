@@ -75,7 +75,12 @@ create_statements = [
             Ville NVARCHAR(50),
             Region NVARCHAR(50),
             Registration_Date DATE,
-            Client_Type NVARCHAR(30)
+            Client_Type NVARCHAR(30),
+            R_Score INT,
+            F_Score INT,
+            M_Score INT,
+            RFM_Score INT,
+            SegmentDetail NVARCHAR(50)
         );
     END
     """,
@@ -103,16 +108,10 @@ create_statements = [
     IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Time]') AND type = N'U')
     BEGIN
         CREATE TABLE Dim_Time (
-            FullDate DATE PRIMARY KEY,
-            Year INT,
-            Month INT,
-            Day INT,
-            MonthName NVARCHAR(20),
-            DayOfWeek NVARCHAR(20),
-            Trimester VARCHAR(5),
-            YearMonth VARCHAR(10),
+            DateID INT PRIMARY KEY,
+            FullDate VARCHAR(10),
             IsWeekend BIT,
-            IsHoliday BIT
+            IsJourFerie BIT
         );
     END
     """,
@@ -129,12 +128,12 @@ create_statements = [
     IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Fact_Sale]') AND type = N'U')
     BEGIN
         CREATE TABLE Fact_Sale (
-            TransactionID VARCHAR(20) PRIMARY KEY,
+            TransactionID VARCHAR(20),
             channel_ID INT,
             Client_ID VARCHAR(50),
             Payment_ID INT,
             Product_ID INT,
-            FullDate DATE,
+            DateID INT,
             PromotionID INT,
             CampagneID INT,
             Montant DECIMAL(12, 2),
@@ -173,7 +172,7 @@ create_statements = [
     """
     IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK_Fact_Sale_Time')
         ALTER TABLE Fact_Sale ADD CONSTRAINT FK_Fact_Sale_Time
-            FOREIGN KEY (FullDate) REFERENCES Dim_Time(FullDate);
+            FOREIGN KEY (DateID) REFERENCES Dim_Time(DateID);
     """,
     """
     IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK_Fact_Sale_Promotion')
@@ -186,34 +185,12 @@ create_statements = [
             FOREIGN KEY (CampagneID) REFERENCES Dim_Campagne(Campaign_ID);
     """,
     """
-    -- Migrate a table created by an earlier version of this script (Client_ID as PK)
-    -- to the new surrogate-key schema. Safe because this table is fully
-    -- truncated and reloaded every run -- there's no history to lose.
+    -- Dim_Client_Segment is retired: RFM scores and segment labels now live
+    -- directly on Dim_Client. Drop the old table if it's still around from a
+    -- previous run.
     IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND type = N'U')
-       AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND name = 'Segment_ID')
     BEGIN
         DROP TABLE Dim_Client_Segment;
-    END
-    """,
-    """
-    IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Dim_Client_Segment]') AND type = N'U')
-    BEGIN
-        CREATE TABLE Dim_Client_Segment (
-            Segment_ID INT PRIMARY KEY,
-            Client_ID VARCHAR(50) NOT NULL UNIQUE,
-            Recency INT,
-            Frequency INT,
-            Monetary DECIMAL(12, 2),
-            R_Score INT,
-            F_Score INT,
-            M_Score INT,
-            RFM_Score INT,
-            Cluster_ID INT,
-            Segment_Label NVARCHAR(50),
-            SegmentDetail NVARCHAR(50),
-            Last_Updated DATE,
-            FOREIGN KEY (Client_ID) REFERENCES Dim_Client(Client_ID)
-        );
     END
     """,
 ]
@@ -249,15 +226,6 @@ Dim_Client = pygrametl.tables.Dimension(
     lookupatts=['Client_ID']
 )
 
-Dim_Client_Segment = pygrametl.tables.Dimension(
-    name='Dim_Client_Segment',
-    key='Segment_ID',
-    attributes=['Client_ID', 'Recency', 'Frequency', 'Monetary', 'R_Score', 'F_Score',
-                'M_Score', 'RFM_Score', 'Cluster_ID', 'Segment_Label',
-                'SegmentDetail', 'Last_Updated'],
-    lookupatts=['Client_ID']
-)
-
 Dim_Payment = pygrametl.tables.Dimension(
     name='Dim_Payment',
     key='Payment_ID',
@@ -274,9 +242,8 @@ Dim_Product = pygrametl.tables.Dimension(
 
 Dim_Time = pygrametl.tables.Dimension(
     name='Dim_Time',
-    key='FullDate',
-    attributes=['Year', 'Month', 'Day', 'MonthName', 'DayOfWeek', 'Trimester',
-                'YearMonth', 'IsWeekend', 'IsHoliday'],
+    key='DateID',
+    attributes=['FullDate', 'IsWeekend', 'IsJourFerie'],
     lookupatts=['FullDate']
 )
 
@@ -290,7 +257,7 @@ Dim_Promotion = pygrametl.tables.Dimension(
 fact_sale = pygrametl.tables.FactTable(
     name='Fact_Sale',
     keyrefs=['TransactionID', 'channel_ID', 'Client_ID', 'Payment_ID', 'Product_ID',
-             'FullDate', 'PromotionID', 'CampagneID'],
+             'DateID', 'PromotionID', 'CampagneID'],
     measures=['Montant', 'Quantite', 'Remise', 'MontantRemise', 'MontantFinal',
               'CoutAcquisition', 'Marge', 'Satisfaction', 'NPS', 'PointsFidelite']
 )
@@ -380,8 +347,7 @@ dwh_connection.commit()
 # 9. Load Dim_Time
 # ---------------------------------------------------------------------------
 date_source = source_cursor.execute(
-    "SELECT DISTINCT DateVente, Annee, Mois, MoisNum, Trimestre, YearMonth, "
-    "JourSemaine, EstWeekend, EstJourFerie FROM source"
+    "SELECT DISTINCT DateVente, EstWeekend, EstJourFerie FROM source"
 )
 counter = 0
 for row in date_source:
@@ -392,16 +358,9 @@ for row in date_source:
         full_date = full_date.date()
 
     date_data = {
-        "FullDate": full_date,
-        "Year": row.Annee,
-        "Month": row.MoisNum,
-        "Day": full_date.day,
-        "MonthName": row.Mois,
-        "DayOfWeek": row.JourSemaine,
-        "Trimester": row.Trimestre,
-        "YearMonth": row.YearMonth,
+        "FullDate": full_date.strftime("%d-%m-%Y"),
         "IsWeekend": 1 if row.EstWeekend == "Oui" else 0,
-        "IsHoliday": 1 if row.EstJourFerie == "Oui" else 0
+        "IsJourFerie": 1 if row.EstJourFerie == "Oui" else 0
     }
     counter += 1
     Dim_Time.ensure(date_data)
@@ -457,7 +416,7 @@ for row in sale_source:
     client_id = Dim_Client.ensure({"Client_ID": row.ClientID})
     payment_id = Dim_Payment.ensure({"Payment_Mode": row.ModePaiement})
     product_id = Dim_Product.ensure({"Product_Name": row.Produit})
-    Dim_Time.ensure({"FullDate": full_date})
+    date_id = Dim_Time.ensure({"FullDate": full_date.strftime("%d-%m-%Y")})
     promotion_id = Dim_Promotion.ensure(
         {"CodePromotion": row.CodePromo if row.CodePromo else 'Aucune'}
     )
@@ -470,7 +429,7 @@ for row in sale_source:
         "Client_ID": client_id,
         "Payment_ID": payment_id,
         "Product_ID": product_id,
-        "FullDate": full_date,
+        "DateID": date_id,
         "PromotionID": promotion_id,
         "CampagneID": campagne_id,
         "Montant": row.Montant,
@@ -490,8 +449,10 @@ print(f"Inserted {counter} rows into Fact_Sale.")
 dwh_connection.commit()
 
 # ---------------------------------------------------------------------------
-# 11.5 Compute RFM and assign client segments with the pretrained K-means model
-#      Full overwrite every run: no history, just today's snapshot.
+# 11.5 Compute RFM and assign client segments with the pretrained K-means model,
+#      then write the scores/labels directly onto Dim_Client (no separate
+#      Dim_Client_Segment table anymore). Full overwrite every run: no
+#      history, just today's snapshot.
 # ---------------------------------------------------------------------------
 with open(MODELS_DIR / "scaler.pkl", "rb") as f:
     rfm_scaler = pickle.load(f)
@@ -511,16 +472,23 @@ CLUSTER_LABELS = {
 
 # Reference point for Recency: this is a static historical dataset, not a live feed,
 # so "today" = the latest sale date actually present in Fact_Sale, not datetime.now().
-reference_date = dwh_cursor.execute("SELECT MAX(FullDate) FROM Fact_Sale").fetchone()[0]
+reference_date = dwh_cursor.execute(
+    """
+    SELECT MAX(CONVERT(date, dt.FullDate, 105))
+    FROM Fact_Sale f
+    JOIN Dim_Time dt ON f.DateID = dt.DateID
+    """
+).fetchone()[0]
 
 rfm_rows = dwh_cursor.execute(
     """
-    SELECT Client_ID,
-           DATEDIFF(day, MAX(FullDate), ?) AS Recency,
-           COUNT(TransactionID)            AS Frequency,
-           SUM(MontantFinal)               AS Monetary
-    FROM Fact_Sale
-    GROUP BY Client_ID
+    SELECT f.Client_ID,
+           DATEDIFF(day, MAX(CONVERT(date, dt.FullDate, 105)), ?) AS Recency,
+           COUNT(f.TransactionID)                                 AS Frequency,
+           SUM(f.MontantFinal)                                    AS Monetary
+    FROM Fact_Sale f
+    JOIN Dim_Time dt ON f.DateID = dt.DateID
+    GROUP BY f.Client_ID
     """,
     reference_date
 ).fetchall()
@@ -587,28 +555,29 @@ if remaining_mask.any():
     rfm_df.loc[stale_mask, "SegmentDetail"] = "Perdus"
     rfm_df.loc[watch_mask, "SegmentDetail"] = "À Surveiller"
 
-# Full overwrite: truncate then reinsert every run via the pygrametl Dimension object
-dwh_cursor.execute("TRUNCATE TABLE Dim_Client_Segment")
-
+# Every run recomputes RFM fresh against the current population, so each
+# client's row in Dim_Client is simply overwritten with this run's numbers.
 counter = 0
 for r in rfm_df.itertuples(index=False):
-    segment_data = {
-        "Client_ID": str(r.Client_ID),
-        "Recency": int(r.Recency),      # cast off numpy/pandas dtypes so pyodbc accepts them
-        "Frequency": int(r.Frequency),
-        "Monetary": float(r.Monetary),
-        "R_Score": int(r.R_Score),
-        "F_Score": int(r.F_Score),
-        "M_Score": int(r.M_Score),
-        "RFM_Score": int(r.RFM_Score),
-        "Cluster_ID": int(r.Cluster_ID),
-        "Segment_Label": r.Segment_Label,
-        "SegmentDetail": r.SegmentDetail,
-        "Last_Updated": reference_date
-    }
-    Dim_Client_Segment.insert(segment_data)
+    dwh_cursor.execute(
+        """
+        UPDATE Dim_Client
+        SET R_Score = ?,
+            F_Score = ?,
+            M_Score = ?,
+            RFM_Score = ?,
+            SegmentDetail = ?
+        WHERE Client_ID = ?
+        """,
+        int(r.R_Score),      # cast off numpy/pandas dtypes so pyodbc accepts them
+        int(r.F_Score),
+        int(r.M_Score),
+        int(r.RFM_Score),
+        r.SegmentDetail,
+        str(r.Client_ID)
+    )
     counter += 1
-print(f"Inserted {counter} rows into Dim_Client_Segment.")
+print(f"Updated {counter} rows in Dim_Client with RFM segmentation.")
 dwh_connection.commit()
 
 # ---------------------------------------------------------------------------
